@@ -1,0 +1,2 @@
+# Tracku
+Tracku discord bot
