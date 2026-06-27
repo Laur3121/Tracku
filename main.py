@@ -2,7 +2,11 @@ import discord
 from discord import app_commands
 import os
 import sqlite3
-from datetime import datetime, timezone, date
+import io
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -27,6 +31,37 @@ def init_db():
             ended_at TEXT
         )
     ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            user_id TEXT PRIMARY KEY,
+            user_name TEXT,
+            joined_at TEXT
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+def is_joined(user_id):
+    conn = sqlite3.connect('tracku.db')
+    c = conn.cursor()
+    c.execute('SELECT user_id FROM users WHERE user_id = ?', (user_id,))
+    result = c.fetchone()
+    conn.close()
+    return result is not None
+
+def join_user(user_id, user_name):
+    conn = sqlite3.connect('tracku.db')
+    c = conn.cursor()
+    c.execute('INSERT OR IGNORE INTO users (user_id, user_name, joined_at) VALUES (?, ?, ?)',
+              (user_id, user_name, datetime.now(timezone.utc).isoformat()))
+    conn.commit()
+    conn.close()
+
+def leave_user(user_id):
+    conn = sqlite3.connect('tracku.db')
+    c = conn.cursor()
+    c.execute('DELETE FROM users WHERE user_id = ?', (user_id,))
+    c.execute('DELETE FROM activity_log WHERE user_id = ?', (user_id,))
     conn.commit()
     conn.close()
 
@@ -65,6 +100,53 @@ def get_today_logs(user_id):
     conn.close()
     return rows
 
+def get_week_logs(user_id):
+    conn = sqlite3.connect('tracku.db')
+    c = conn.cursor()
+    week_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+    c.execute('''
+        SELECT app_name,
+               SUM(
+                   CASE 
+                       WHEN ended_at IS NOT NULL 
+                       THEN (julianday(ended_at) - julianday(started_at)) * 1440
+                       ELSE 0
+                   END
+               ) as total_minutes
+        FROM activity_log
+        WHERE user_id = ? AND started_at >= ?
+        GROUP BY app_name
+        ORDER BY total_minutes DESC
+    ''', (user_id, week_ago))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def get_server_ranking(guild):
+    conn = sqlite3.connect('tracku.db')
+    c = conn.cursor()
+    week_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+    member_ids = [str(m.id) for m in guild.members]
+    placeholders = ','.join('?' * len(member_ids))
+    c.execute(f'''
+        SELECT user_name, app_name,
+               SUM(
+                   CASE 
+                       WHEN ended_at IS NOT NULL 
+                       THEN (julianday(ended_at) - julianday(started_at)) * 1440
+                       ELSE 0
+                   END
+               ) as total_minutes
+        FROM activity_log
+        WHERE user_id IN ({placeholders}) AND started_at >= ?
+        GROUP BY user_id, app_name
+        ORDER BY total_minutes DESC
+        LIMIT 10
+    ''', member_ids + [week_ago])
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
 @client.event
 async def on_ready():
     init_db()
@@ -73,6 +155,9 @@ async def on_ready():
 
 @client.event
 async def on_presence_update(before, after):
+    if not is_joined(str(after.id)):
+        return
+
     before_apps = {a.name for a in before.activities if a.name}
     after_apps = {a.name for a in after.activities if a.name}
 
@@ -84,15 +169,32 @@ async def on_presence_update(before, after):
         print(f'{after.name} が {app} を終了')
         log_end(str(after.id), app)
 
-@tree.command(name='tracku', description='今日のアクティビティを表示')
-@app_commands.describe(action='today または week')
+@tree.command(name='tracku', description='Trackuコマンド')
+@app_commands.describe(action='join / leave / today / week / summary / ranking')
 async def tracku(interaction: discord.Interaction, action: str = 'today'):
-    if action == 'today':
+
+    if action == 'join':
+        if is_joined(str(interaction.user.id)):
+            await interaction.response.send_message('すでに参加済みです。', ephemeral=True)
+            return
+        join_user(str(interaction.user.id), interaction.user.name)
+        await interaction.response.send_message(
+            '✅ Trackuに参加しました！アクティビティの記録を開始します。\n`/tracku leave` でいつでも停止・データ削除できます。',
+            ephemeral=True
+        )
+
+    elif action == 'leave':
+        if not is_joined(str(interaction.user.id)):
+            await interaction.response.send_message('まだ参加していません。', ephemeral=True)
+            return
+        leave_user(str(interaction.user.id))
+        await interaction.response.send_message('🗑️ データを削除して退出しました。', ephemeral=True)
+
+    elif action == 'today':
         logs = get_today_logs(str(interaction.user.id))
         if not logs:
             await interaction.response.send_message('今日のアクティビティはまだありません。')
             return
-
         embed = discord.Embed(
             title=f'📊 {interaction.user.name} の今日のアクティビティ',
             color=0x5865F2
@@ -100,9 +202,56 @@ async def tracku(interaction: discord.Interaction, action: str = 'today'):
         for app_name, started_at, ended_at in logs:
             start = datetime.fromisoformat(started_at).strftime('%H:%M')
             end = datetime.fromisoformat(ended_at).strftime('%H:%M') if ended_at else '進行中'
+            embed.add_field(name=app_name, value=f'{start} → {end}', inline=False)
+        await interaction.response.send_message(embed=embed)
+
+    elif action == 'week':
+        logs = get_week_logs(str(interaction.user.id))
+        if not logs:
+            await interaction.response.send_message('今週のアクティビティはまだありません。')
+            return
+        embed = discord.Embed(
+            title=f'📊 {interaction.user.name} の今週のアクティビティ',
+            color=0x5865F2
+        )
+        for app_name, total_minutes in logs:
+            hours = int(total_minutes // 60)
+            minutes = int(total_minutes % 60)
+            embed.add_field(name=app_name, value=f'{hours}時間{minutes}分', inline=False)
+        await interaction.response.send_message(embed=embed)
+
+    elif action == 'summary':
+        logs = get_week_logs(str(interaction.user.id))
+        if not logs:
+            await interaction.response.send_message('今週のアクティビティはまだありません。')
+            return
+        await interaction.response.defer()
+        labels = [row[0] for row in logs]
+        sizes = [row[1] for row in logs]
+        fig, ax = plt.subplots(figsize=(6, 6))
+        ax.pie(sizes, labels=labels, autopct='%1.1f%%', startangle=90)
+        ax.set_title(f'{interaction.user.name} の今週の使用時間')
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', bbox_inches='tight')
+        buf.seek(0)
+        plt.close()
+        await interaction.followup.send(file=discord.File(buf, filename='summary.png'))
+
+    elif action == 'ranking':
+        logs = get_server_ranking(interaction.guild)
+        if not logs:
+            await interaction.response.send_message('今週のデータがありません。')
+            return
+        embed = discord.Embed(
+            title='🏆 今週のサーバーランキング',
+            color=0xF1C40F
+        )
+        for i, (user_name, app_name, total_minutes) in enumerate(logs):
+            hours = int(total_minutes // 60)
+            minutes = int(total_minutes % 60)
             embed.add_field(
-                name=app_name,
-                value=f'{start} → {end}',
+                name=f'{i+1}. {user_name}',
+                value=f'{app_name} - {hours}時間{minutes}分',
                 inline=False
             )
         await interaction.response.send_message(embed=embed)
