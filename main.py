@@ -170,7 +170,15 @@ async def on_presence_update(before, after):
         log_end(str(after.id), app)
 
 @tree.command(name='tracku', description='Trackuコマンド')
-@app_commands.describe(action='join / leave / today / week / summary / ranking')
+@app_commands.describe(action='アクション')
+@app_commands.choices(action=[
+    app_commands.Choice(name='join - 記録を開始', value='join'),
+    app_commands.Choice(name='leave - 記録を停止', value='leave'),
+    app_commands.Choice(name='today - 今日のログ', value='today'),
+    app_commands.Choice(name='week - 今週のログ', value='week'),
+    app_commands.Choice(name='summary - 円グラフ', value='summary'),
+    app_commands.Choice(name='ranking - ランキング', value='ranking'),
+])
 async def tracku(interaction: discord.Interaction, action: str = 'today'):
 
     if action == 'join':
@@ -226,13 +234,30 @@ async def tracku(interaction: discord.Interaction, action: str = 'today'):
             await interaction.response.send_message('今週のアクティビティはまだありません。')
             return
         await interaction.response.defer()
+
         labels = [row[0] for row in logs]
         sizes = [row[1] for row in logs]
-        fig, ax = plt.subplots(figsize=(6, 6))
-        ax.pie(sizes, labels=labels, autopct='%1.1f%%', startangle=90)
-        ax.set_title(f'{interaction.user.name} の今週の使用時間')
+
+        plt.rcParams['font.family'] = 'Hiragino Sans'
+        colors = ['#5865F2', '#57F287', '#FEE75C', '#EB459E', '#ED4245']
+
+        fig, ax = plt.subplots(figsize=(7, 7), facecolor='#2B2D31')
+        ax.set_facecolor('#2B2D31')
+        wedges, texts, autotexts = ax.pie(
+            sizes,
+            labels=labels,
+            autopct='%1.1f%%',
+            startangle=90,
+            colors=colors[:len(labels)],
+            textprops={'color': 'white', 'fontsize': 11}
+        )
+        for autotext in autotexts:
+            autotext.set_color('white')
+        ax.set_title(f'{interaction.user.name} の今週の使用時間',
+                     color='white', fontsize=14, pad=20)
+
         buf = io.BytesIO()
-        plt.savefig(buf, format='png', bbox_inches='tight')
+        plt.savefig(buf, format='png', bbox_inches='tight', facecolor='#2B2D31')
         buf.seek(0)
         plt.close()
         await interaction.followup.send(file=discord.File(buf, filename='summary.png'))
